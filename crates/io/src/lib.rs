@@ -246,57 +246,63 @@ pub struct MeshFeature {
 /// Read 3MF, STL, OBJ or glTF bytes (the format from `file`'s extension) into a MeshImport
 /// feature. A glTF file's bodies are all built where they are (see [`read_gltf`] for its node
 /// tree), and it can't read buffers in other files.
+fn mesh_file_size_limit(ext: &str) -> usize {
+    if ext == "stl" { MAX_STL_BYTES } else { MAX_3MF_BYTES }
+}
+
+/// Read 3MF, STL, OBJ or glTF bytes (the format from `file`'s extension) into a MeshImport
+/// feature. A glTF file's bodies are all built where they are (see [`read_gltf`] for its node
+/// tree), and it can't read buffers in other files.
 pub fn mesh_import_feature(bytes: &[u8], file: &str) -> Result<MeshFeature> {
     if is_gltf_path(file) {
-        let mut no_files = |name: &str| Err(format!("`{name}` can't be read here"));
+        let mut no_files = |name: &str| Err(format!("\\`{name}\\` can't be read here"));
         let mut g = read_gltf(bytes, file, &mut no_files)?;
         g.flatten();
         return Ok(g.feature);
     }
-    if bytes.len() > MAX_3MF_BYTES {
-        return Err(IoError::Invalid(format!("mesh file too large ({} MB)", bytes.len() >> 20)));
-    }
     let path = std::path::Path::new(file);
     let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "Mesh".into());
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let max_bytes = mesh_file_size_limit(&ext);
+    if bytes.len() > max_bytes {
+        let format_name = if ext == "stl" { "STL" } else { "mesh" };
+        return Err(IoError::Invalid(format!("{format_name} file too large ({} bytes; limit {} bytes)", bytes.len(), max_bytes)));
+    }
     let (objects, warnings) = if ext == "obj" {
         obj::read_obj(bytes, &stem)?
     } else if ext == "stl" {
-        let tris = read_stl(bytes)?;
-        if tris.is_empty() {
-            return Err(IoError::Invalid("STL has no triangles".into()));
-        }
-        let positions: Vec<Vec3> = tris.iter().flatten().map(|v| Vec3::new(v[0] as f64, v[1] as f64, v[2] as f64)).collect();
-        let n = u32::try_from(tris.len()).map_err(|_| IoError::Invalid("STL too large".into()))?;
-        let triangles = (0..n).map(|i| [i * 3, i * 3 + 1, i * 3 + 2]).collect();
-        (vec![MeshObject { name: stem.clone(), positions, triangles, ..Default::default() }], Vec::new())
+        (vec![read_stl_object(bytes, &stem)?], Vec::new())
     } else {
         read_3mf(bytes)?
     };
-    // Check every mesh now, so the command fails rather than the timeline.
+    // Validate each mesh before the command succeeds, then release its source buffers as soon as
+    // its compact document representation has been built. Large multi-object imports otherwise
+    // keep all source meshes alive while duplicating their coordinates into MeshData.
+    let mut body_names = Vec::with_capacity(objects.len());
     let mut meshes = Vec::with_capacity(objects.len());
-    for o in &objects {
-        solidcraft_kernel::mesh_body(&o.positions, &o.triangles).map_err(|e| IoError::Invalid(format!("mesh `{}`: {e}", o.name)))?;
+    for o in objects {
+        solidcraft_kernel::mesh_body(&o.positions, &o.triangles).map_err(|e| IoError::Invalid(format!("mesh \\`{}\\`: {e}", o.name)))?;
+        let body_name = o.name;
+        body_names.push(body_name.clone());
         meshes.push(solidcraft_doc::MeshData {
-            name: o.name.clone(),
+            name: body_name,
             positions: o.positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
             triangles: o.triangles.iter().flatten().copied().collect(),
             color: o.color,
         });
     }
-    let name = match objects.as_slice() {
-        [only] if !only.name.trim().is_empty() => only.name.clone(),
+    let name = match body_names.as_slice() {
+        [only] if !only.trim().is_empty() => only.clone(),
         _ => stem,
     };
     let file_name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| file.to_string());
     Ok(MeshFeature {
         name,
-        body_names: objects.iter().map(|o| o.name.clone()).collect(),
+        body_names,
         kind: solidcraft_doc::FeatureKind::MeshImport { file: file_name, meshes },
         warnings,
     })
 }
-
 /// Export formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -569,44 +575,57 @@ pub fn write_design(doc: &Document) -> Vec<u8> {
     doc.to_json().into_bytes()
 }
 
-/// Parse a binary or ASCII STL (used by tests and round-trip checks): triangles.
-pub fn read_stl(bytes: &[u8]) -> Result<Vec<[[f32; 3]; 3]>> {
+/// Visit the valid triangles in a binary or ASCII STL without allocating an intermediate
+/// triangle array. Mesh imports use this to build indexed vertices directly.
+fn for_each_stl_triangle(
+    bytes: &[u8],
+    mut visit: impl FnMut([[f32; 3]; 3]) -> Result<()>,
+) -> Result<usize> {
+    if bytes.len() > MAX_STL_BYTES {
+        return Err(IoError::Invalid(format!("STL file too large ({} bytes; limit {} bytes)", bytes.len(), MAX_STL_BYTES)));
+    }
     // Binary when the size matches the triangle count in the header (some binary files start
     // with "solid" too); ASCII when the text has facets.
     let count = bytes.get(80..84).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
     let binary_size = count.is_some_and(|n| bytes.len() == 84 + n.saturating_mul(50));
-    let head = String::from_utf8_lossy(bytes.get(..bytes.len().min(512)).unwrap_or_default()).to_string();
-    let ascii = !binary_size && head.trim_start().starts_with("solid") && String::from_utf8_lossy(bytes).contains("facet");
-    let mut tris = Vec::new();
+    let head = String::from_utf8_lossy(bytes.get(..bytes.len().min(512)).unwrap_or_default());
+    let ascii = !binary_size && head.trim_start().starts_with("solid") && bytes.windows(5).any(|w| w == b"facet");
     let ok = |v: &[f32; 3]| v.iter().all(|x| x.is_finite() && x.abs() < 1e9);
+    let mut parsed = 0usize;
     if ascii {
-        let s = String::from_utf8_lossy(bytes);
-        let mut cur: Vec<[f32; 3]> = Vec::new();
-        for l in s.lines() {
-            let mut it = l.split_whitespace();
+        // Decode one line at a time: a large ASCII STL should not need a second full-size copy.
+        let mut vertices = [[0.0f32; 3]; 3];
+        let mut vertex_count = 0usize;
+        for raw_line in bytes.split(|b| *b == b'\n') {
+            let line = String::from_utf8_lossy(raw_line);
+            let mut it = line.split_whitespace();
             match it.next() {
                 Some("vertex") => {
-                    let v: Vec<f32> = it.filter_map(|x| x.parse().ok()).collect();
-                    if let [x, y, z] = v[..] {
-                        cur.push([x, y, z]);
+                    let mut values = it.filter_map(|x| x.parse::<f32>().ok());
+                    if let (Some(x), Some(y), Some(z)) = (values.next(), values.next(), values.next())
+                        && values.next().is_none()
+                    {
+                        if vertex_count < 3 {
+                            vertices[vertex_count] = [x, y, z];
+                        }
+                        vertex_count = vertex_count.saturating_add(1);
                     }
                 }
                 // Each facet takes exactly its three vertices (a bad vertex drops the facet).
                 Some("endfacet") => {
-                    if let [a, b, c] = cur[..]
-                        && [a, b, c].iter().all(ok)
-                    {
-                        tris.push([a, b, c]);
+                    if vertex_count == 3 && vertices.iter().all(ok) {
+                        parsed += 1;
+                        if parsed > MAX_STL_TRIANGLES {
+                            return Err(IoError::Invalid(format!("STL with more than {MAX_STL_TRIANGLES} triangles")));
+                        }
+                        visit(vertices)?;
                     }
-                    cur.clear();
+                    vertex_count = 0;
                 }
                 _ => {}
             }
-            if tris.len() > MAX_STL_TRIANGLES {
-                return Err(IoError::Invalid(format!("STL with more than {MAX_STL_TRIANGLES} triangles")));
-            }
         }
-        return Ok(tris);
+        return Ok(parsed);
     }
     let n = count.ok_or_else(|| IoError::Invalid("short STL".into()))?;
     // A wrong count in the header (some writers leave 0): use the triangles that are there.
@@ -619,21 +638,71 @@ pub fn read_stl(bytes: &[u8]) -> Result<Vec<[[f32; 3]; 3]>> {
         return Err(IoError::Invalid(format!("STL with {n} triangles (limit {MAX_STL_TRIANGLES})")));
     }
     let f = |o: usize| bytes.get(o..o + 4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(f32::NAN);
-    tris.reserve(n);
     for i in 0..n {
         // The facet normal (first 12 bytes) is ignored: winding gives the orientation.
         let o = 84 + i * 50 + 12;
         let v = |k: usize| [f(o + k * 12), f(o + k * 12 + 4), f(o + k * 12 + 8)];
-        let t = [v(0), v(1), v(2)];
-        if t.iter().all(ok) {
-            tris.push(t);
+        let triangle = [v(0), v(1), v(2)];
+        if triangle.iter().all(ok) {
+            parsed += 1;
+            visit(triangle)?;
         }
     }
-    Ok(tris)
+    Ok(parsed)
+}
+
+/// Parse a binary or ASCII STL (used by tests and round-trip checks): triangles.
+pub fn read_stl(bytes: &[u8]) -> Result<Vec<[[f32; 3]; 3]>> {
+    let count = bytes.get(80..84).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let mut triangles = Vec::new();
+    if let Some(n) = count
+        && bytes.len() == 84 + n.saturating_mul(50)
+        && n <= MAX_STL_TRIANGLES
+    {
+        triangles.reserve(n);
+    }
+    for_each_stl_triangle(bytes, |triangle| {
+        triangles.push(triangle);
+        Ok(())
+    })?;
+    Ok(triangles)
+}
+
+/// Build an indexed mesh from STL facets. STL stores triangle corners independently; reusing
+/// identical coordinates avoids tripling the vertex storage for ordinary tessellated surfaces.
+fn read_stl_object(bytes: &[u8], name: &str) -> Result<MeshObject> {
+    let mut positions = Vec::<Vec3>::new();
+    let mut triangles = Vec::<[u32; 3]>::new();
+    let mut vertex_indices = std::collections::HashMap::<[u32; 3], u32>::new();
+    let triangle_count = for_each_stl_triangle(bytes, |triangle| {
+        let mut indices = [0u32; 3];
+        for (slot, vertex) in indices.iter_mut().zip(triangle) {
+            // Treat negative and positive zero as the same point.
+            let key = vertex.map(|x| if x == 0.0 { 0 } else { x.to_bits() });
+            let index = if let Some(&index) = vertex_indices.get(&key) {
+                index
+            } else {
+                let index = u32::try_from(positions.len()).map_err(|_| IoError::Invalid("STL too large".into()))?;
+                positions.push(Vec3::new(vertex[0] as f64, vertex[1] as f64, vertex[2] as f64));
+                let _ = vertex_indices.insert(key, index);
+                index
+            };
+            *slot = index;
+        }
+        triangles.push(indices);
+        Ok(())
+    })?;
+    if triangle_count == 0 {
+        return Err(IoError::Invalid("STL has no triangles".into()));
+    }
+    Ok(MeshObject { name: name.to_owned(), positions, triangles, ..Default::default() })
 }
 
 /// Most triangles we read from one STL file.
 pub const MAX_STL_TRIANGLES: usize = 20_000_000;
+/// Largest STL file we read: 84-byte header plus 50 bytes per allowed binary triangle.
+/// ASCII STL uses the same byte cap.
+pub const MAX_STL_BYTES: usize = 84 + MAX_STL_TRIANGLES * 50;
 
 #[cfg(test)]
 mod tests {
@@ -714,6 +783,20 @@ mod tests {
             let r = std::panic::catch_unwind(|| read_stl(b).map(|t| t.len()));
             assert!(r.is_ok());
         }
+    }
+
+    #[test]
+    fn large_stl_import_has_its_own_limit_and_reuses_vertices() {
+        assert_eq!(mesh_file_size_limit("stl"), MAX_STL_BYTES);
+        assert_eq!(mesh_file_size_limit("3mf"), MAX_3MF_BYTES);
+        assert!(MAX_STL_BYTES > MAX_3MF_BYTES);
+
+        let bytes = cube_stl(&[], b"cube", None, [0.0; 3]);
+        let feature = mesh_import_feature(&bytes, "cube.stl").unwrap();
+        let FeatureKind::MeshImport { meshes, .. } = feature.kind else { panic!() };
+        assert_eq!(meshes[0].positions.len(), 8 * 3, "the cube should have eight unique vertices");
+        assert_eq!(meshes[0].triangles.len(), 12 * 3);
+        assert!((mesh_volume(&bytes) - 1000.0).abs() < 1e-6);
     }
 
     #[test]
