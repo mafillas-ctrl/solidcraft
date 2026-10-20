@@ -1,0 +1,26 @@
+name: Rust mesh import tests
+
+on:
+  push:
+    branches:
+      - "ci/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  solidcraft-io-tests:
+    name: solidcraft-io tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+      - name: Run large STL regression test
+        run: cargo test -p solidcraft-io large_stl_import_has_its_own_limit_and_reuses_vertices -- --nocapture
+      - name: Run complete IO crate test suite
+        run: cargo test -p solidcraft-io
