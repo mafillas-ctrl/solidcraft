@@ -255,7 +255,7 @@ fn mesh_file_size_limit(ext: &str) -> usize {
 /// tree), and it can't read buffers in other files.
 pub fn mesh_import_feature(bytes: &[u8], file: &str) -> Result<MeshFeature> {
     if is_gltf_path(file) {
-        let mut no_files = |name: &str| Err(format!("\\`{name}\\` can't be read here"));
+        let mut no_files = |name: &str| Err(format!("`{name}` can't be read here"));
         let mut g = read_gltf(bytes, file, &mut no_files)?;
         g.flatten();
         return Ok(g.feature);
@@ -281,7 +281,7 @@ pub fn mesh_import_feature(bytes: &[u8], file: &str) -> Result<MeshFeature> {
     let mut body_names = Vec::with_capacity(objects.len());
     let mut meshes = Vec::with_capacity(objects.len());
     for o in objects {
-        solidcraft_kernel::mesh_body(&o.positions, &o.triangles).map_err(|e| IoError::Invalid(format!("mesh \\`{}\\`: {e}", o.name)))?;
+        solidcraft_kernel::mesh_body(&o.positions, &o.triangles).map_err(|e| IoError::Invalid(format!("mesh `{}`: {e}", o.name)))?;
         let body_name = o.name;
         body_names.push(body_name.clone());
         meshes.push(solidcraft_doc::MeshData {
